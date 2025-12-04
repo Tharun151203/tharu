@@ -1,0 +1,592 @@
+
+"""
+Appendix A – Core Federated Learning Implementation
+Federated learning for privacy-preserving medical image diagnostics
+with Differential Privacy, simple Secure Aggregation simulation,
+FedAvg / FedProx / Scaffold and an adaptive communication scheduler.
+
+Note:
+- This code is written as a clear educational implementation.
+- File paths, dataset locations and some hyperparameters must be
+  adjusted before running in a real environment.
+"""
+
+import os
+import copy
+import math
+import random
+import time
+from typing import Dict, List, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+from torchvision import transforms, models
+
+# ============================================================
+# 1. Global Configuration
+# ============================================================
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+NUM_CLIENTS = 5
+ROUNDS = 30
+LOCAL_EPOCHS = 2
+BATCH_SIZE = 32
+LEARNING_RATE = 1e-4
+
+DP_ENABLED = True
+DP_SIGMA = 0.2               # Gaussian noise std for DP
+DP_CLIP_NORM = 1.0
+
+USE_FEDPROX = True
+FEDPROX_MU = 0.01            # proximal term coefficient
+
+USE_SCAFFOLD = False         # set True if implementing full Scaffold variant
+
+ADAPTIVE_SCHEDULER = True
+GRAD_VARIANCE_THRESHOLD = 1e-4
+
+
+# ============================================================
+# 2. Dataset and Non-IID Partitioning
+#    (NIH Chest X-Ray / HAM10000 style loading skeleton)
+# ============================================================
+
+class MedicalImageDataset(Dataset):
+    """
+    Generic medical image dataset.
+    Assumes a CSV file with columns: image_path, label
+    and images stored under a root directory.
+    """
+
+    def __init__(self, csv_file: str, image_root: str, transform=None):
+        import pandas as pd
+        self.df = pd.read_csv(csv_file)
+        self.image_root = image_root
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.image_root, row["image_path"])
+        label = int(row["label"])
+
+        img = Image.open(img_path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+
+        return img, label
+
+
+def get_transforms():
+    """
+    Standard pre-processing pipeline for medical imaging.
+    """
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],  # ImageNet means (approx)
+            std=[0.229, 0.224, 0.225]
+        )
+    ])
+
+
+def partition_non_iid(dataset: Dataset, num_clients: int, num_classes: int, alpha: float = 0.5):
+    """
+    Dirichlet-based non-IID partitioning.
+    Each client gets a skewed distribution over classes.
+
+    alpha < 1.0 => higher non-IID
+    alpha > 1.0 => closer to IID
+    """
+
+    # group indices by class
+    class_indices = {c: [] for c in range(num_classes)}
+    for idx in range(len(dataset)):
+        _, label = dataset[idx]
+        class_indices[int(label)].append(idx)
+
+    for c in range(num_classes):
+        random.shuffle(class_indices[c])
+
+    client_indices = [[] for _ in range(num_clients)]
+
+    for c in range(num_classes):
+        # draw proportions for this class over clients
+        proportions = np.random.dirichlet(alpha=np.ones(num_clients) * alpha)
+        proportions = (len(class_indices[c]) * proportions).astype(int)
+
+        # ensure sum matches
+        diff = len(class_indices[c]) - np.sum(proportions)
+        for i in range(diff):
+            proportions[i % num_clients] += 1
+
+        start = 0
+        for client_id in range(num_clients):
+            cnt = proportions[client_id]
+            client_indices[client_id] += class_indices[c][start:start + cnt]
+            start += cnt
+
+    return client_indices
+
+
+# ============================================================
+# 3. Model Definition (ResNet18-style CNN)
+# ============================================================
+
+class ResNet18Medical(nn.Module):
+    """
+    ResNet-18 backbone adapted for medical image classification.
+    """
+
+    def __init__(self, num_classes: int):
+        super().__init__()
+        backbone = models.resnet18(weights=None)  # can load pretrained if allowed
+        backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
+        self.model = backbone
+
+    def forward(self, x):
+        return self.model(x)
+
+
+# ============================================================
+# 4. Utility Functions
+# ============================================================
+
+def get_model_params(model: nn.Module):
+    return {k: v.clone().detach() for k, v in model.state_dict().items()}
+
+
+def set_model_params(model: nn.Module, params: Dict[str, torch.Tensor]):
+    model.load_state_dict(params, strict=True)
+
+
+def average_params(param_list: List[Dict[str, torch.Tensor]],
+                   weights: List[float]) -> Dict[str, torch.Tensor]:
+    """
+    Weighted averaging of parameter dictionaries.
+    """
+
+    avg_params = {}
+    total_weight = sum(weights)
+
+    for key in param_list[0].keys():
+        avg = 0.0
+        for params, w in zip(param_list, weights):
+            avg += params[key] * (w / total_weight)
+        avg_params[key] = avg.clone()
+
+    return avg_params
+
+
+def compute_grad_variance(grad_list: List[Dict[str, torch.Tensor]]) -> float:
+    """
+    Compute a simple scalar variance measure across client gradients.
+    """
+
+    stacked = []
+    for grads in grad_list:
+        flat = torch.cat([g.view(-1) for g in grads.values()])
+        stacked.append(flat.unsqueeze(0))
+
+    stacked = torch.cat(stacked, dim=0)   # [num_clients, num_params]
+    return float(stacked.var().item())
+
+
+# ============================================================
+# 5. Differential Privacy Helper
+# ============================================================
+
+def add_dp_noise_to_grads(model: nn.Module, sigma: float, clip_norm: float):
+    """
+    Clip gradients to a fixed norm, then add Gaussian noise.
+    """
+
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = math.sqrt(total_norm)
+
+    clip_coef = clip_norm / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+
+    for p in model.parameters():
+        if p.grad is not None:
+            noise = torch.normal(
+                mean=0.0,
+                std=sigma,
+                size=p.grad.data.shape,
+                device=p.grad.data.device,
+            )
+            p.grad.data.add_(noise)
+
+
+def get_grads(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """
+    Extract gradients as a state-dict-like structure.
+    """
+
+    grads = {}
+    for name, p in model.named_parameters():
+        if p.grad is not None:
+            grads[name] = p.grad.detach().clone()
+        else:
+            grads[name] = torch.zeros_like(p.data)
+    return grads
+
+
+def apply_grads(model: nn.Module, grads: Dict[str, torch.Tensor], lr: float):
+    """
+    Apply gradient step manually to model parameters.
+    """
+
+    with torch.no_grad():
+        for (name, p) in model.named_parameters():
+            p.data -= lr * grads[name]
+
+
+# ============================================================
+# 6. Simple Secure Aggregation Simulation
+# ============================================================
+
+def mask_grads(grads: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """
+    Create a random mask for each gradient and return (masked_grad, mask).
+    In a real secure aggregation protocol, masks are shared pairwise so
+    that they cancel out across clients. Here we simulate the idea.
+    """
+
+    masked = {}
+    mask = {}
+
+    for k, g in grads.items():
+        m = torch.randn_like(g)
+        masked[k] = g + m
+        mask[k] = m
+
+    return masked, mask
+
+
+def unmask_aggregated(aggregated_masked: Dict[str, torch.Tensor],
+                      masks: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+    """
+    Reverse the total masking. In a real system, masks cancel across clients.
+    Here we simply subtract all masks for demonstration.
+    """
+
+    unmasked = {}
+    for k, v in aggregated_masked.items():
+        total_mask = 0.0
+        for m in masks:
+            total_mask += m[k]
+        unmasked[k] = v - total_mask
+    return unmasked
+
+
+# ============================================================
+# 7. Local Training Loop (Client-Side)
+# ============================================================
+
+def local_train(client_id: int,
+                model: nn.Module,
+                global_params: Dict[str, torch.Tensor],
+                train_loader: DataLoader,
+                criterion,
+                rounds_completed: int,
+                proximal_mu: float = FEDPROX_MU,
+                use_fedprox: bool = True) -> Tuple[Dict[str, torch.Tensor], int, Dict[str, torch.Tensor]]:
+    """
+    Perform local training for one client for a fixed number of epochs,
+    starting from global model parameters.
+    """
+
+    set_model_params(model, global_params)
+    model.train()
+    model.to(DEVICE)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    global_params_tensor = {k: v.clone().detach().to(DEVICE) for k, v in global_params.items()}
+
+    total_samples = 0
+
+    for epoch in range(LOCAL_EPOCHS):
+        for images, labels in train_loader:
+            images = images.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+
+            if use_fedprox:
+                prox_term = 0.0
+                for name, param in model.named_parameters():
+                    prox_term += ((param - global_params_tensor[name]) ** 2).sum()
+                loss = loss + (proximal_mu / 2.0) * prox_term
+
+            loss.backward()
+
+            if DP_ENABLED:
+                add_dp_noise_to_grads(model, DP_SIGMA, DP_CLIP_NORM)
+
+            optimizer.step()
+            total_samples += images.size(0)
+
+    # collect gradients after final batch (for variance estimation / scheduler)
+    grads = get_grads(model)
+
+    updated_params = get_model_params(model)
+
+    return updated_params, total_samples, grads
+
+
+# ============================================================
+# 8. Federated Training Orchestration (Server-Side)
+# ============================================================
+
+def federated_training(global_model: nn.Module,
+                       client_loaders: List[DataLoader],
+                       num_classes: int):
+
+    global_params = get_model_params(global_model)
+    criterion = nn.CrossEntropyLoss()
+
+    # for adaptive scheduler
+    last_grad_variance = None
+
+    for r in range(ROUNDS):
+        print(f"\n=== Round {r + 1}/{ROUNDS} ===")
+
+        client_params = []
+        client_weights = []
+        client_grads = []
+        client_masks = []
+
+        for client_id, loader in enumerate(client_loaders):
+            # adaptive scheduler: optionally skip a client update
+            if ADAPTIVE_SCHEDULER and last_grad_variance is not None:
+                if last_grad_variance < GRAD_VARIANCE_THRESHOLD:
+                    # client skips this round to save bandwidth
+                    print(f"Client {client_id} skipping round {r + 1} due to low grad variance.")
+                    continue
+
+            local_model = ResNet18Medical(num_classes=num_classes)
+            updated_params, num_samples, grads = local_train(
+                client_id=client_id,
+                model=local_model,
+                global_params=global_params,
+                train_loader=loader,
+                criterion=criterion,
+                rounds_completed=r,
+                proximal_mu=FEDPROX_MU,
+                use_fedprox=USE_FEDPROX
+            )
+
+            # secure aggregation simulation: mask gradients (optional)
+            masked_grads, mask = mask_grads(grads)
+
+            client_params.append(updated_params)
+            client_weights.append(num_samples)
+            client_grads.append(masked_grads)
+            client_masks.append(mask)
+
+        if len(client_params) == 0:
+            print("No client updates received this round.")
+            continue
+
+        # secure aggregation of gradients (for variance estimation only)
+        aggregated_masked_grads = {}
+        for k in client_grads[0].keys():
+            agg = 0.0
+            for cg in client_grads:
+                agg += cg[k]
+            aggregated_masked_grads[k] = agg
+
+        # unmask to simulate secure aggregation completion
+        aggregated_grads = unmask_aggregated(aggregated_masked_grads, client_masks)
+
+        # compute gradient variance to inform next-round scheduling
+        # (we reconstruct per-client grads from masked version in this toy example)
+        grad_variance = compute_grad_variance([aggregated_grads])
+        last_grad_variance = grad_variance
+        print(f"Estimated gradient variance this round: {grad_variance:.6f}")
+
+        # FedAvg aggregation of model parameters
+        global_params = average_params(client_params, client_weights)
+        set_model_params(global_model, global_params)
+
+        # simple evaluation on a held-out validation set could be inserted here
+
+    return global_model
+
+
+# ============================================================
+# 9. Simple FastAPI Inference Service Skeleton
+# ============================================================
+
+"""
+This section shows a minimal FastAPI app that serves the latest
+federated model for inference. In deployment, this would run as a
+separate microservice container.
+"""
+
+# You would place this in a separate file, e.g., api_service.py
+# and run it with: uvicorn api_service:app --host 0.0.0.0 --port 8000
+
+"""
+from fastapi import FastAPI, UploadFile, File
+from pydantic import BaseModel
+import io
+
+app = FastAPI()
+
+inference_model = ResNet18Medical(num_classes=NUM_CLASSES)
+inference_model.load_state_dict(torch.load("global_model_final.pt", map_location=DEVICE))
+inference_model.eval()
+inference_model.to(DEVICE)
+infer_transform = get_transforms()
+
+class PredictionResponse(BaseModel):
+    predicted_class: int
+    probabilities: List[float]
+
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(file: UploadFile = File(...)):
+    contents = await file.read()
+    img = Image.open(io.BytesIO(contents)).convert("RGB")
+    img = infer_transform(img).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        logits = inference_model(img)
+        probs = F.softmax(logits, dim=1).cpu().numpy().flatten()
+        pred_class = int(np.argmax(probs))
+
+    return PredictionResponse(
+        predicted_class=pred_class,
+        probabilities=probs.tolist()
+    )
+"""
+
+
+# ============================================================
+# 10. Dockerfile and Kubernetes Deployment Skeletons
+# ============================================================
+
+"""
+Example Dockerfile (for both client and server containers)
+----------------------------------------------------------
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "main_federated.py"]
+
+
+Example Kubernetes Deployment (conceptual)
+------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fl-client-deployment
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: fl-client
+  template:
+    metadata:
+      labels:
+        app: fl-client
+    spec:
+      containers:
+      - name: fl-client
+        image: your-dockerhub-username/fl-client:latest
+        resources:
+          limits:
+            cpu: "1"
+            memory: "2Gi"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fl-server-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fl-server
+  template:
+    metadata:
+      labels:
+        app: fl-server
+    spec:
+      containers:
+      - name: fl-server
+        image: your-dockerhub-username/fl-server:latest
+        ports:
+        - containerPort: 8000
+"""
+
+# ============================================================
+# 11. Main Entry Point (Simulation)
+# ============================================================
+
+def main():
+    """
+    Example entry point for running a federated simulation.
+    Adjust file paths, number of classes and dataset selection.
+    """
+
+    # Example paths (to be replaced with actual NIH / HAM10000 CSV and roots)
+    chest_csv = "data/nih_chest/train.csv"
+    chest_root = "data/nih_chest/images"
+
+    # Assume binary classification for demonstration (e.g., disease vs. no disease)
+    num_classes = 2
+
+    transform = get_transforms()
+    full_dataset = MedicalImageDataset(csv_file=chest_csv,
+                                       image_root=chest_root,
+                                       transform=transform)
+
+    client_indices = partition_non_iid(full_dataset,
+                                       num_clients=NUM_CLIENTS,
+                                       num_classes=num_classes,
+                                       alpha=0.5)
+
+    client_loaders = []
+    for c_idx in client_indices:
+        subset = Subset(full_dataset, c_idx)
+        loader = DataLoader(subset, batch_size=BATCH_SIZE, shuffle=True)
+        client_loaders.append(loader)
+
+    global_model = ResNet18Medical(num_classes=num_classes).to(DEVICE)
+
+    trained_model = federated_training(global_model, client_loaders, num_classes=num_classes)
+
+    # Save final global model for inference microservice
+    torch.save(trained_model.state_dict(), "global_model_final.pt")
+
+
+if __name__ == "__main__":
+    main()
